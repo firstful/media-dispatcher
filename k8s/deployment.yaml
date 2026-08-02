@@ -1,0 +1,54 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: media-dispatcher
+  namespace: transcode
+  labels:
+    app: media-dispatcher
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: media-dispatcher
+  template:
+    metadata:
+      labels:
+        app: media-dispatcher
+    spec:
+      containers:
+        - name: dispatcher
+          image: 192.168.1.2:3000/reeds/media-dispatcher:1.0.0
+          # Idle by design: the Hermes nightly cron invokes the pipeline via
+          # `kubectl exec deploy/media-dispatcher -- python3 /app/media-optimize.py ...`
+          # so it stays agent-driven (reports/acts on findings).
+          command: ["/bin/sh", "-c", "trap : TERM INT; sleep infinity & wait"]
+          env:
+            - name: JELLYFIN_ROOT
+              value: /media/jellyfin
+            - name: TRANSCODE_INBOX
+              value: /media/inbox
+            - name: TRANSCODE_DONE
+              value: /media/done
+            - name: MEDIA_STATE_DIR
+              value: /media/state
+            - name: MEDIA_LOG
+              value: /media/state/media-optimize.log
+          volumeMounts:
+            - name: transcode-work
+              mountPath: /media
+            - name: jellyfin
+              mountPath: /media/jellyfin
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+      volumes:
+        - name: transcode-work
+          persistentVolumeClaim:
+            claimName: transcode-work
+        - name: jellyfin
+          persistentVolumeClaim:
+            claimName: jellyfin-media

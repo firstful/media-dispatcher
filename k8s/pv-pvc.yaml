@@ -1,0 +1,26 @@
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: jellyfin-media
+spec:
+  accessModes: [ReadWriteMany]
+  capacity:
+    storage: 1500Gi
+  nfs:
+    server: 192.168.1.2
+    path: /mnt/raid_store/jellyfin
+  persistentVolumeReclaimPolicy: Retain
+  volumeMode: Filesystem
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: jellyfin-media
+  namespace: transcode
+spec:
+  accessModes: [ReadWriteMany]
+  storageClassName: ""
+  volumeName: jellyfin-media
+  resources:
+    requests:
+      storage: 1500Gi
