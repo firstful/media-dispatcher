@@ -411,10 +411,15 @@ def cmd_validate():
             status = m.get("subs_status", "unknown")
             if status == "synced":
                 n_synced += 1
-            elif status in ("sync_failed", "too_small", "not_found"):
+                ver = "OK"  # subs matched the audio — identity verified
+            elif status == "sync_failed":
                 n_failed += 1
-            ver = "OK" if (score is not None and score >= 0.9 and dur_ok) else (
-                  "SUBS-ONLY" if (score is None and dur_ok) else "FLAG")
+                ver = "FLAG"  # subs did NOT match audio — possible wrong episode
+            elif status in ("too_small", "not_found"):
+                n_failed += 1
+                ver = "UNVERIFIED"  # no usable subs to check
+            else:
+                ver = "UNVERIFIED"
             rows.append({
                 "rel": str(p.relative_to(JELLYFIN)), "status": status,
                 "score": score, "dur_ok": dur_ok, "verdict": ver,
