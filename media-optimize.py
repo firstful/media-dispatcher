@@ -40,10 +40,30 @@ PROBE_CACHE = STATE.joinpath("probe-cache.json")
 
 VIDEO_EXTS = {".mkv", ".mp4", ".avi", ".ts", ".m2ts", ".mov"}
 SUB_EXTS = {".srt", ".vtt", ".ass", ".sub"}
+MARKER_EXTS = {".json"}  # worker-written <video>.json transcode markers
 MIN_FILE_BYTES = 50 * 1024 * 1024      # smaller = sample/trailer/short
 MIN_SAVINGS_BYTES = 300 * 1024 * 1024  # re-encode only if projected savings >= this
 RETENTION_DAYS = 14                    # replaced originals kept this long
 ALREADY_OPTIMAL_CODECS = {"hevc", "av1"}
+MARKER_VERSION = 1                     # bump to force re-evaluation of marked files
+
+
+def read_marker(p):
+    """Return parsed marker dict if valid (version + size matches), else None."""
+    marker = p.parent.joinpath(p.stem + ".json")
+    try:
+        if not marker.exists():
+            return None
+        m = json.loads(marker.read_text())
+        if m.get("marker_version") != MARKER_VERSION:
+            return None
+        if m.get("status") not in ("transcoded", "pass_through"):
+            return None
+        if m.get("output_size_bytes") != p.stat().st_size:
+            return None  # stale — file changed since it was processed
+        return m
+    except Exception:
+        return None
 
 
 def log(msg):
@@ -142,6 +162,18 @@ def scan():
                     continue
             if in_flight(p):
                 continue
+            # Worker-written marker: no probe needed — use its recorded metadata.
+            # (Marker gate also applied in evaluate(); this skips the ffprobe.)
+            m = read_marker(p)
+            if m is not None:
+                items.append((p, {
+                    "codec": m.get("codec") or "marked",
+                    "height": m.get("height") or 0,
+                    "bit_rate": 0,
+                    "duration": m.get("duration_s") or 0,
+                    "size": p.stat().st_size,
+                }))
+                continue
             info = probe_cached(p, cache)
             if not info or not info["duration"]:
                 continue
@@ -161,9 +193,13 @@ def evaluate(p, info):
     codec = info["codec"] or ""
     est_out = int(target * info["duration"] / 8)
     savings = info["size"] - est_out
+    has_sub = any(p.parent.joinpath(p.stem + e).exists() for e in SUB_EXTS)
+    # Marker gate: a worker-written marker is authoritative — the file was
+    # already transcoded or judged already-compressed; never re-encode it.
+    if read_marker(p) is not None:
+        return False, not has_sub, savings, est_out
     needs_reencode = (src_br > target and codec not in ALREADY_OPTIMAL_CODECS
                       and savings >= MIN_SAVINGS_BYTES)
-    has_sub = any(p.parent.joinpath(p.stem + e).exists() for e in SUB_EXTS)
     needs_subs = not has_sub
     return needs_reencode, needs_subs, savings, est_out
 
@@ -268,7 +304,9 @@ def cmd_reconcile(purge=True):
         if parts[0] not in ("movies", "tv"):
             log("  skip unrecognized done path: %s" % rel)
             continue
-        if out.suffix.lower() not in VIDEO_EXTS and out.suffix.lower() not in SUB_EXTS:
+        if (out.suffix.lower() not in VIDEO_EXTS
+                and out.suffix.lower() not in SUB_EXTS
+                and out.suffix.lower() not in MARKER_EXTS):
             continue
         # DEFER: if the matching inbox file is still .processing, the worker is
         # mid-encode and this done/ output is a partial write — never move it.
@@ -314,7 +352,7 @@ def cmd_reconcile(purge=True):
                        max(0, old_size - new_size) // 1048576))
             else:
                 log("  MOVED %s (pass-through)" % rel)
-        else:  # subtitle sidecar -> move, overwrite existing
+        else:  # sidecar (.srt/.json marker) -> move, overwrite existing
             shutil.move(str(out), str(target))
             log("  SIDE %s" % rel)
     if purge:
