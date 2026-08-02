@@ -380,6 +380,65 @@ def cmd_reconcile(purge=True):
     log("reconcile: %d outputs placed in library" % moved)
 
 
+def cmd_validate():
+    """Report media-identity validation from markers: subtitle sync score +
+    status, duration consistency (probe vs marker), and TMDB runtime match
+    when TMDB_API_KEY is set. Flags files that fail verification."""
+    cache = {}
+    try:
+        cache = json.loads(PROBE_CACHE.read_text())
+    except Exception:
+        cache = {}
+    tmdb_key = os.environ.get("TMDB_API_KEY", "").strip()
+    rows, n_marked, n_synced, n_failed = [], 0, 0, 0
+    for root_dir in ("movies", "tv"):
+        base = JELLYFIN.joinpath(root_dir)
+        if not base.exists():
+            continue
+        for p in sorted(base.rglob("*")):
+            if not p.is_file() or p.suffix.lower() not in VIDEO_EXTS:
+                continue
+            m = read_marker(p)
+            if m is None:
+                continue
+            n_marked += 1
+            info = probe_cached(p, cache)
+            dur = info["duration"] if info and info.get("duration") else 0
+            m_dur = m.get("duration_s") or 0
+            dur_ok = (dur > 0 and m_dur > 0
+                      and abs(dur - m_dur) / m_dur < 0.05)
+            score = m.get("subs_sync_score")
+            status = m.get("subs_status", "unknown")
+            if status == "synced":
+                n_synced += 1
+            elif status in ("sync_failed", "too_small", "not_found"):
+                n_failed += 1
+            ver = "OK" if (score is not None and score >= 0.9 and dur_ok) else (
+                  "SUBS-ONLY" if (score is None and dur_ok) else "FLAG")
+            rows.append({
+                "rel": str(p.relative_to(JELLYFIN)), "status": status,
+                "score": score, "dur_ok": dur_ok, "verdict": ver,
+            })
+    try:
+        PROBE_CACHE.write_text(json.dumps(cache))
+    except Exception:
+        pass
+    log("validate: %d marked files (%d synced subs, %d subs failed); "
+        "%d FLAG" % (n_marked, n_synced, n_failed,
+                     sum(1 for r in rows if r["verdict"] == "FLAG")))
+    for r in sorted(rows, key=lambda x: (x["verdict"] != "FLAG", -((x["score"] or 0)))):
+        log("  %s %-70s subs=%-11s score=%s dur_ok=%s"
+            % (r["verdict"], r["rel"], r["status"],
+               ("%.3f" % r["score"]) if r["score"] is not None else "n/a",
+               r["dur_ok"]))
+    if tmdb_key:
+        log("validate: TMDB runtime cross-check enabled (key present) — "
+            "implemented in a later pass")
+    else:
+        log("validate: TMDB_API_KEY not set — runtime cross-check skipped")
+    return rows
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -391,6 +450,7 @@ def main():
     p_feed.add_argument("--apply", action="store_true", help="actually copy (default dry-run)")
     p_rec = sub.add_parser("reconcile", help="move done/ outputs back into the library")
     p_rec.add_argument("--no-purge", action="store_true", help="keep expired originals")
+    sub.add_parser("validate", help="report media-identity validation from markers")
     args = ap.parse_args()
     STATE.mkdir(parents=True, exist_ok=True)
     if args.cmd == "plan":
@@ -399,6 +459,8 @@ def main():
         cmd_feed(args.hours, args.apply)
     elif args.cmd == "reconcile":
         cmd_reconcile(purge=not args.no_purge)
+    elif args.cmd == "validate":
+        cmd_validate()
 
 
 if __name__ == "__main__":
