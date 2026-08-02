@@ -22,11 +22,23 @@ Safety:
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
 import time
+import urllib.parse
+import urllib.request
 from pathlib import Path
+
+# This host's resolver returns NAT64 AAAA records (64:ff9b::…) first and has no
+# IPv6 egress — socket/urllib connect() hangs on them. Force IPv4 resolution
+# (same as curl -4). Must run before any socket use.
+import socket as _socket
+_orig_getaddrinfo = _socket.getaddrinfo
+def _getaddrinfo_ipv4(*args, **kwargs):
+    return [r for r in _orig_getaddrinfo(*args, **kwargs) if r[0] == _socket.AF_INET]
+_socket.getaddrinfo = _getaddrinfo_ipv4
 
 # All paths env-driven so the same script runs on the host (defaults) and inside
 # the k3s dispatcher pod (NFS mounts at /media/...).
@@ -46,6 +58,100 @@ MIN_SAVINGS_BYTES = 300 * 1024 * 1024  # re-encode only if projected savings >= 
 RETENTION_DAYS = 14                    # replaced originals kept this long
 ALREADY_OPTIMAL_CODECS = {"hevc", "av1"}
 MARKER_VERSION = 1                     # bump to force re-evaluation of marked files
+TVDB_CACHE = STATE / "tvdb-cache.json"  # title|year|season|ep -> runtime_min
+
+
+def tvdb_login():
+    """Bearer token for api4.thetvdb.com (cached in state). None if no key."""
+    key = os.environ.get("TVDB_API_KEY", "").strip()
+    if not key:
+        return None
+    tokf = STATE / "tvdb-token.json"
+    try:
+        t = json.loads(tokf.read_text())
+        if t.get("expires", 0) > time.time() + 3600:
+            return t["token"]
+    except Exception:
+        pass
+    try:
+        req = urllib.request.Request(
+            "https://api4.thetvdb.com/v4/login",
+            data=json.dumps({"apikey": key}).encode(),
+            headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=15) as r:
+            token = json.loads(r.read())["data"]["token"]
+        tokf.write_text(json.dumps({"token": token,
+                                    "expires": time.time() + 6 * 86400}))
+        return token
+    except Exception as e:
+        log("tvdb login failed: %s" % e)
+        return None
+
+
+def tvdb_get(token, path):
+    req = urllib.request.Request(
+        "https://api4.thetvdb.com/v4/" + path,
+        headers={"Authorization": "Bearer " + token})
+    with urllib.request.urlopen(req, timeout=20) as r:
+        return json.loads(r.read())
+
+
+def tvdb_episode_runtime(show, year, season, episode):
+    """Expected runtime (minutes) for a TV episode via TVDB v4, cached.
+    Returns None when unknown (no key, sparse entry, lookup failure)."""
+    key = "%s|%s|%d|%d" % (show.lower(), year or "", season, episode)
+    try:
+        c = json.loads(TVDB_CACHE.read_text())
+    except Exception:
+        c = {}
+    if key in c:
+        return c[key]
+    token = tvdb_login()
+    val = None
+    if token:
+        try:
+            q = urllib.parse.quote(show)
+            search = tvdb_get(token, "search?query=%s&type=series" % q)
+            sid = None
+            for r in search.get("data", []):
+                if year and str(r.get("year")) == str(year):
+                    sid = str(r.get("objectID", "")).replace("series-", "")
+                    break
+            if sid is None and search.get("data"):
+                sid = str(search["data"][0]["objectID"]).replace("series-", "")
+            if sid:
+                ext = tvdb_get(token, "series/%s/extended?meta=episodes" % sid)
+                for e in ext.get("data", {}).get("episodes", []):
+                    if (e.get("seasonNumber") == season
+                            and e.get("number") == episode):
+                        val = e.get("runtime")
+                        break
+        except Exception as ex:
+            log("tvdb lookup failed for %s: %s" % (show, ex))
+    c[key] = val
+    try:
+        TVDB_CACHE.write_text(json.dumps(c))
+    except Exception:
+        pass
+    return val
+
+
+def parse_tv_ref(rel):
+    """From a library-relative tv path, return (show, year, season, episode)
+    or None. Expects 'tv/Show (Year)/Season NN/Show SxxEyy.ext'."""
+    m = re.search(r"S(\d{1,2})E(\d{1,2})", rel, re.IGNORECASE)
+    if not m:
+        return None
+    parts = Path(rel).parts
+    if len(parts) < 4 or parts[0] != "tv":
+        return None
+    show_dir = parts[1]
+    ym = re.search(r"^(.*?)\s*\((\d{4})\)$", show_dir)
+    show = ym.group(1).strip() if ym else show_dir
+    year = ym.group(2) if ym else None
+    sm = re.search(r"Season\s+(\d+)", parts[2], re.IGNORECASE)
+    season = int(sm.group(1)) if sm else int(m.group(1))
+    return show, year, season, int(m.group(2))
 
 
 def read_marker(p):
@@ -409,9 +515,20 @@ def cmd_validate():
                       and abs(dur - m_dur) / m_dur < 0.05)
             score = m.get("subs_sync_score")
             status = m.get("subs_status", "unknown")
+            rel = str(p.relative_to(JELLYFIN))
+            # TVDB runtime cross-check (TV episodes only; movie runtimes are
+            # null in TVDB v4). Mismatch > 10% (+5 min grace) flags the file.
+            tvdb_verdict = None
+            tv_ref = parse_tv_ref(rel)
+            if tv_ref:
+                show, year, season, episode = tv_ref
+                rt = tvdb_episode_runtime(show, year, season, episode)
+                if rt:
+                    tvdb_verdict = ("ok" if abs(dur - rt * 60)
+                                    <= max(0.10 * rt * 60, 300) else "mismatch")
             if status == "synced":
                 n_synced += 1
-                ver = "OK"  # subs matched the audio — identity verified
+                ver = "OK"
             elif status == "sync_failed":
                 n_failed += 1
                 ver = "FLAG"  # subs did NOT match audio — possible wrong episode
@@ -420,9 +537,12 @@ def cmd_validate():
                 ver = "UNVERIFIED"  # no usable subs to check
             else:
                 ver = "UNVERIFIED"
+            if tvdb_verdict == "mismatch":
+                ver = "FLAG"  # duration disagrees with TVDB reference
             rows.append({
-                "rel": str(p.relative_to(JELLYFIN)), "status": status,
-                "score": score, "dur_ok": dur_ok, "verdict": ver,
+                "rel": rel, "status": status,
+                "score": score, "dur_ok": dur_ok,
+                "tvdb": tvdb_verdict, "verdict": ver,
             })
     try:
         PROBE_CACHE.write_text(json.dumps(cache))
@@ -432,15 +552,14 @@ def cmd_validate():
         "%d FLAG" % (n_marked, n_synced, n_failed,
                      sum(1 for r in rows if r["verdict"] == "FLAG")))
     for r in sorted(rows, key=lambda x: (x["verdict"] != "FLAG", -((x["score"] or 0)))):
-        log("  %s %-70s subs=%-11s score=%s dur_ok=%s"
+        log("  %s %-70s subs=%-11s score=%s dur_ok=%s tvdb=%s"
             % (r["verdict"], r["rel"], r["status"],
                ("%.3f" % r["score"]) if r["score"] is not None else "n/a",
-               r["dur_ok"]))
-    if tmdb_key:
-        log("validate: TMDB runtime cross-check enabled (key present) — "
-            "implemented in a later pass")
+               r["dur_ok"], r["tvdb"] or "n/a"))
+    if os.environ.get("TVDB_API_KEY", "").strip():
+        log("validate: TVDB runtime cross-check enabled")
     else:
-        log("validate: TMDB_API_KEY not set — runtime cross-check skipped")
+        log("validate: TVDB_API_KEY not set — runtime cross-check skipped")
     return rows
 
 

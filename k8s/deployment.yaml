@@ -17,7 +17,7 @@ spec:
     spec:
       containers:
         - name: dispatcher
-          image: 192.168.1.2:3000/reeds/media-dispatcher:1.0.3
+          image: 192.168.1.2:3000/reeds/media-dispatcher:1.0.4
           # Idle by design: the Hermes nightly cron invokes the pipeline via
           # `kubectl exec deploy/media-dispatcher -- python3 /app/media-optimize.py ...`
           # so it stays agent-driven (reports/acts on findings).
@@ -33,6 +33,9 @@ spec:
               value: /media/state
             - name: MEDIA_LOG
               value: /media/state/media-optimize.log
+          envFrom:
+            - secretRef:
+                name: tvdb-api-key   # TVDB_API_KEY — media runtime cross-check
           volumeMounts:
             - name: transcode-work
               mountPath: /media
