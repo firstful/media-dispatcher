@@ -416,7 +416,17 @@ def cmd_reconcile(purge=True):
             continue
         # DEFER: if the matching inbox file is still .processing, the worker is
         # mid-encode and this done/ output is a partial write — never move it.
-        if INBOX.joinpath(str(rel) + ".processing").exists():
+        proc = INBOX.joinpath(str(rel) + ".processing")
+        if not proc.exists() and out.suffix.lower() not in VIDEO_EXTS:
+            # sidecar (.srt/.json): the worker still owns the job while the
+            # VIDEO's .processing exists — defer so subtitles.py doesn't later
+            # recreate a subs-only marker that clobbers the full one.
+            for vext in VIDEO_EXTS:
+                vrel = str(rel)[:-len(out.suffix)] + vext + ".processing"
+                if INBOX.joinpath(vrel).exists():
+                    proc = INBOX.joinpath(vrel)
+                    break
+        if proc.exists():
             log("  DEFER %s (still encoding)" % rel)
             continue
         target = JELLYFIN.joinpath(*parts)
