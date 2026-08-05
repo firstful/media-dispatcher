@@ -17,9 +17,10 @@ Safety:
 - Library files are COPIED to the inbox; originals stay until reconcile verifies
   the new output (ffprobe) and moves it into place, then the original is removed.
 - Replaced originals are kept in done/originals/ for RETENTION_DAYS as rollback.
-- Re-encode only non-HEVC/AV1 sources with >= MIN_SAVINGS_RATIO projected
-  savings ratio AND a source bitrate above the tier target (below-tier sources
-  are already compressed — the worker passes them through untouched).
+- Feed non-HEVC/AV1 sources (recency-ranked) so the worker can run its
+  speculative-compression probe; the worker decides transcode vs pass-through
+  from MEASURED savings (natural HEVC bitrate on real samples) and persists
+  probe_ratio to the <video>.json marker.
 """
 import argparse
 import json
@@ -322,8 +323,13 @@ def evaluate(p, info):
     # already transcoded or judged already-compressed; never re-encode it.
     if read_marker(p) is not None:
         return False, not has_sub, savings, est_out, savings_ratio
-    needs_reencode = (src_br > target and codec not in ALREADY_OPTIMAL_CODECS
-                      and savings_ratio >= MIN_SAVINGS_RATIO)
+    # The WORKER decides transcode vs pass-through with a speculative probe
+    # (measured natural HEVC bitrate on real samples). The planner's only job
+    # is to feed non-optimal codecs, recency-ranked, so the probe can run.
+    # The old estimated gate (src_br > target AND ratio >= MIN_SAVINGS_RATIO)
+    # was provably wrong for low-bitrate simple content: kids cartoons
+    # estimate negative savings yet probe ~80% real HEVC savings.
+    needs_reencode = codec not in ALREADY_OPTIMAL_CODECS
     needs_subs = not has_sub
     return needs_reencode, needs_subs, savings, est_out, savings_ratio
 
@@ -341,10 +347,11 @@ def build_plan(hours):
         except OSError:
             mtime = 0.0
         age_days = max(0.0, (now - mtime) / 86400)
-        # Recency-weighted score: fresh files rank above ancient ones of equal
-        # compressibility; a genuinely huge savings ratio still wins.
+        # Recency-weighted score — the PRIMARY ranking signal. Fresh downloads
+        # get probed (and transcoded) before ancient rips; estimated ratio is
+        # only a tiebreak (the worker's probe is the real gate).
         recency = RECENCY_BOOST / (1.0 + age_days / RECENCY_HALF_LIFE_DAYS)
-        score = ratio * (1.0 + recency) if nr else 0.0
+        score = recency if nr else 0.0
         ranked.append({
             "path": str(p),
             "rel": str(p.relative_to(JELLYFIN)),
@@ -360,7 +367,7 @@ def build_plan(hours):
             "reencode": nr,
             "subs": ns,
         })
-    ranked.sort(key=lambda x: (not x["reencode"], -x["score"]))
+    ranked.sort(key=lambda x: (not x["reencode"], -x["score"], -x["ratio"]))
     budget_s = float(hours) * 3600
     selected, used = [], 0.0
     for it in ranked:
