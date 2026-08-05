@@ -45,7 +45,7 @@ _socket.getaddrinfo = _getaddrinfo_ipv4
 
 # All paths env-driven so the same script runs on the host (defaults) and inside
 # the k3s dispatcher pod (NFS mounts at /media/...).
-JELLYFIN = Path(os.environ.get("JELLYFIN_ROOT", "/mnt/raid_store/jellyfin"))
+JELLYFIN = Path(os.environ.get("JELLYFIN_ROOT", "/mnt/raid_store/jellyfin/Media"))
 INBOX = Path(os.environ.get("TRANSCODE_INBOX", "/mnt/raid_store/transcode/inbox"))
 DONE = Path(os.environ.get("TRANSCODE_DONE", "/mnt/raid_store/transcode/done"))
 LOG = Path(os.environ.get("MEDIA_LOG", "/var/log/media-optimize.log"))
@@ -159,7 +159,7 @@ def parse_tv_ref(rel):
     if not m:
         return None
     parts = Path(rel).parts
-    if len(parts) < 4 or parts[0] != "tv":
+    if len(parts) < 4 or parts[0] not in TV_LIBS:
         return None
     show_dir = parts[1]
     ym = re.search(r"^(.*?)\s*\((\d{4})\)$", show_dir)
@@ -168,6 +168,12 @@ def parse_tv_ref(rel):
     sm = re.search(r"Season\s+(\d+)", parts[2], re.IGNORECASE)
     season = int(sm.group(1)) if sm else int(m.group(1))
     return show, year, season, int(m.group(2))
+
+
+# Per-library roots (Reed 2026-08-05: /mnt/Media layout).
+MEDIA_LIBS = ("Adult_Movies", "Adult_TV", "Kids_Movies", "Kids_TV", "Kids_Youtube")
+TV_LIBS = ("Adult_TV", "Kids_TV", "Kids_Youtube")
+MOVIE_LIBS = ("Adult_Movies", "Kids_Movies")
 
 
 def read_marker(p):
@@ -261,7 +267,7 @@ def scan():
     except Exception:
         cache = {}
     items = []
-    for root_dir in ("movies", "tv"):
+    for root_dir in MEDIA_LIBS:
         base = JELLYFIN.joinpath(root_dir)
         if not base.exists():
             continue
@@ -277,7 +283,7 @@ def scan():
                 continue
             # movies only: multi-video dir guard (skip CD1/CD2, extras piles).
             # TV season dirs legitimately hold many episodes — never skip those.
-            if root_dir == "movies":
+            if root_dir in MOVIE_LIBS:
                 siblings = [f for f in p.parent.iterdir()
                             if f.is_file() and f.suffix.lower() in VIDEO_EXTS]
                 if len(siblings) > 1:
@@ -446,7 +452,7 @@ def cmd_reconcile(purge=True):
         # then moves the synced .srt to the sidecar next to the video).
         if parts[0] in ("originals", "subs") or "subs" in parts:
             continue
-        if parts[0] not in ("movies", "tv"):
+        if parts[0] not in MEDIA_LIBS:
             log("  skip unrecognized done path: %s" % rel)
             continue
         if (out.suffix.lower() not in VIDEO_EXTS
@@ -546,7 +552,7 @@ def cmd_validate():
         cache = {}
     tmdb_key = os.environ.get("TMDB_API_KEY", "").strip()
     rows, n_marked, n_synced, n_failed = [], 0, 0, 0
-    for root_dir in ("movies", "tv"):
+    for root_dir in MEDIA_LIBS:
         base = JELLYFIN.joinpath(root_dir)
         if not base.exists():
             continue
