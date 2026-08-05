@@ -17,7 +17,9 @@ Safety:
 - Library files are COPIED to the inbox; originals stay until reconcile verifies
   the new output (ffprobe) and moves it into place, then the original is removed.
 - Replaced originals are kept in done/originals/ for RETENTION_DAYS as rollback.
-- Re-encode only non-HEVC/AV1 sources with >= MIN_SAVINGS_BYTES projected savings.
+- Re-encode only non-HEVC/AV1 sources with >= MIN_SAVINGS_RATIO projected
+  savings ratio AND a source bitrate above the tier target (below-tier sources
+  are already compressed — the worker passes them through untouched).
 """
 import argparse
 import json
@@ -54,7 +56,20 @@ VIDEO_EXTS = {".mkv", ".mp4", ".avi", ".ts", ".m2ts", ".mov"}
 SUB_EXTS = {".srt", ".vtt", ".ass", ".sub"}
 MARKER_EXTS = {".json"}  # worker-written <video>.json transcode markers
 MIN_FILE_BYTES = 50 * 1024 * 1024      # smaller = sample/trailer/short
-MIN_SAVINGS_BYTES = 300 * 1024 * 1024  # re-encode only if projected savings >= this
+# Re-encode only when the projected savings are a MEANINGFUL FRACTION of the
+# source (compressibility ratio), not a hard byte count. A 200MB episode at
+# 40% savings is worth the encode; a 7GB file at 5% is not. Combined with
+# src_br > target (below-tier sources are already compressed and pass through
+# untouched — see SKIP_IF_COMPRESSED in worker.sh), this keeps the queue to
+# files that actually shrink.
+MIN_SAVINGS_RATIO = float(os.environ.get("MIN_SAVINGS_RATIO", "0.15"))
+# Recency bias for ranking: score = savings_ratio * (1 + recency), where
+# recency = RECENCY_BOOST / (1 + age_days / RECENCY_HALF_LIFE_DAYS).
+# Fresh files get a score nudge (1.0 boost at age 0, decaying to ~0 as the
+# file ages) so newly-downloaded content is processed before ancient rips,
+# without letting a 15%-savings fresh file starve a 50%-savings old one.
+RECENCY_BOOST = float(os.environ.get("RECENCY_BOOST", "1.0"))
+RECENCY_HALF_LIFE_DAYS = float(os.environ.get("RECENCY_HALF_LIFE_DAYS", "30"))
 RETENTION_DAYS = 14                    # replaced originals kept this long
 ALREADY_OPTIMAL_CODECS = {"hevc", "av1"}
 MARKER_VERSION = 1                     # bump to force re-evaluation of marked files
@@ -292,31 +307,44 @@ def scan():
 
 
 def evaluate(p, info):
-    """Return (needs_reencode, needs_subs, savings_bytes, est_out_bytes)."""
+    """Return (needs_reencode, needs_subs, savings_bytes, est_out_bytes,
+    savings_ratio)."""
     height = info["height"] or 0
     target = tier_target_bps(height)
     src_br = info["bit_rate"] or 0
     codec = info["codec"] or ""
+    size = info["size"] or 0
     est_out = int(target * info["duration"] / 8)
-    savings = info["size"] - est_out
+    savings = size - est_out
+    savings_ratio = (savings / size) if size > 0 else 0.0
     has_sub = any(p.parent.joinpath(p.stem + e).exists() for e in SUB_EXTS)
     # Marker gate: a worker-written marker is authoritative — the file was
     # already transcoded or judged already-compressed; never re-encode it.
     if read_marker(p) is not None:
-        return False, not has_sub, savings, est_out
+        return False, not has_sub, savings, est_out, savings_ratio
     needs_reencode = (src_br > target and codec not in ALREADY_OPTIMAL_CODECS
-                      and savings >= MIN_SAVINGS_BYTES)
+                      and savings_ratio >= MIN_SAVINGS_RATIO)
     needs_subs = not has_sub
-    return needs_reencode, needs_subs, savings, est_out
+    return needs_reencode, needs_subs, savings, est_out, savings_ratio
 
 
 def build_plan(hours):
     items = scan()
     ranked = []
+    now = time.time()
     for p, info in items:
-        nr, ns, savings, est = evaluate(p, info)
+        nr, ns, savings, est, ratio = evaluate(p, info)
         if not (nr or ns):
             continue
+        try:
+            mtime = p.stat().st_mtime
+        except OSError:
+            mtime = 0.0
+        age_days = max(0.0, (now - mtime) / 86400)
+        # Recency-weighted score: fresh files rank above ancient ones of equal
+        # compressibility; a genuinely huge savings ratio still wins.
+        recency = RECENCY_BOOST / (1.0 + age_days / RECENCY_HALF_LIFE_DAYS)
+        score = ratio * (1.0 + recency) if nr else 0.0
         ranked.append({
             "path": str(p),
             "rel": str(p.relative_to(JELLYFIN)),
@@ -326,10 +354,13 @@ def build_plan(hours):
             "src_mb": info["size"] // 1048576,
             "est_mb": est // 1048576,
             "savings_mb": savings // 1048576,
+            "ratio": ratio,
+            "age_days": age_days,
+            "score": score,
             "reencode": nr,
             "subs": ns,
         })
-    ranked.sort(key=lambda x: (not x["reencode"], -x["savings_mb"]))
+    ranked.sort(key=lambda x: (not x["reencode"], -x["score"]))
     budget_s = float(hours) * 3600
     selected, used = [], 0.0
     for it in ranked:
@@ -351,10 +382,11 @@ def cmd_plan(hours):
         "selected %d (%.0fmin runtime, budget %.1fh) [scan %.0fs]"
         % (len(ranked), n_re, save_mb, n_sub, len(selected), used / 60, hours, time.time() - t0))
     for it in selected:
-        log("  %s %s  codec=%s %sp %dmin src=%dMB est=%dMB save=%dMB"
+        log("  %s %s  codec=%s %sp %dmin src=%dMB est=%dMB save=%dMB (%.0f%%, %dd)"
             % ("REENC" if it["reencode"] else "SUBS ",
                it["rel"], it["codec"], it["height"], it["dur_min"],
-               it["src_mb"], it["est_mb"], it["savings_mb"]))
+               it["src_mb"], it["est_mb"], it["savings_mb"],
+               it["ratio"] * 100, it["age_days"]))
     try:
         PLAN_CACHE.write_text(json.dumps(selected))
     except Exception:

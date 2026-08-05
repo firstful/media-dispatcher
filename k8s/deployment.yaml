@@ -17,7 +17,7 @@ spec:
     spec:
       containers:
         - name: dispatcher
-          image: 192.168.1.2:3000/reeds/media-dispatcher:1.0.5
+          image: 192.168.1.2:3000/reeds/media-dispatcher:1.0.6
           # Idle by design: the Hermes nightly cron invokes the pipeline via
           # `kubectl exec deploy/media-dispatcher -- python3 /app/media-optimize.py ...`
           # so it stays agent-driven (reports/acts on findings).
