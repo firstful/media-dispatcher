@@ -395,6 +395,7 @@ def cmd_finalize(budget_hours: float, recent_days: float):
             break
         rel = str(video.relative_to(JELLYFIN))
         m = read_sidecar(video)
+        maybe_backfill_tvdb(video, m)  # PBS: search + set tvdb_id (dispatcher has the key)
         run_checks(video, rel, m)
         write_sidecar(video, m)
         n_done += 1
@@ -403,6 +404,62 @@ def cmd_finalize(budget_hours: float, recent_days: float):
 
     log("finalize: %d scanned, %d finalized (%.0f%% of scanned)" %
         (n_done, n_finalized, (100.0 * n_finalized / n_done) if n_done else 0))
+
+
+def maybe_backfill_tvdb(video: Path, m: dict) -> None:
+    """PBS items: search TVDB for the show id and stash it in provenance.
+
+    PBS sets trusted_source=true but tvdb_id=null at publish (the pbskids-sync
+    pod has no TVDB key). The dispatcher pod does — so the crawl fills it in.
+    Uses the pbs_show + pbs_season fields from provenance. One search per show
+    is cached in state, and only runs for items still missing the id."""
+    prov = m.get("provenance") or {}
+    if not prov.get("trusted_source") or prov.get("tvdb_id") is not None:
+        return  # not PBS, or already has the id
+    show = str(prov.get("pbs_show") or "").strip()
+    if not show:
+        return
+    cache_path = STATE / "tvdb-id-search.json"
+    cache = {}
+    try:
+        cache = json.loads(cache_path.read_text())
+    except Exception:
+        pass
+    key = show.lower()
+    if key in cache:
+        tvdb_id = cache[key]
+        if tvdb_id:
+            prov["tvdb_id"] = tvdb_id
+        return
+    # lazy-import media-optimize's tvdb helpers (same pod, has the API key)
+    try:
+        import media_optimize as mo
+    except Exception:
+        return
+    token = mo.tvdb_login()
+    if not token:
+        return
+    try:
+        import urllib.parse as _up
+        data = mo.tvdb_get(token, "search?query=" + _up.quote(show) + "&type=series")
+        hits = data.get("data") or []
+        # prefer exact title match, else first hit
+        tvdb_id = None
+        for h in hits:
+            if (h.get("name") or "").lower() == show.lower():
+                tvdb_id = h.get("id"); break
+        if tvdb_id is None and hits:
+            tvdb_id = hits[0].get("id")
+        cache[key] = tvdb_id
+        try:
+            cache_path.write_text(json.dumps(cache))
+        except Exception:
+            pass
+        if tvdb_id:
+            prov["tvdb_id"] = tvdb_id
+            log("finalize: PBS tvdb_id %s -> %s" % (show, tvdb_id))
+    except Exception as e:
+        log("finalize: tvdb search failed for %s: %s" % (show, e))
 
 
 def main():
