@@ -108,8 +108,14 @@ def detect_source(video: Path, m: dict) -> tuple[str, bool, int | None]:
             return "pbs", True, tvdb_id
         return "yt", True, None
     # Untrusted / no flags: fall back to library root.
+    # cs-downloader = untrusted (aggregates third-party streams): full
+    # verification stays on. Kids_TV keeps the "pbs" label — that label only
+    # drives the duration clip threshold (>=60s) vs the "tv" episode floor
+    # (>=10min), and Peppa/Bluey eps are 5-7 min (2026-08-16 regression: a
+    # 5-min ep flagged "tv" fails duration, so provenance on Kids_TV files
+    # must not relabel them).
     if dl in ("cs-downloader", "cs_downloader", "csdownloader"):
-        return ("tv" if lib == "Kids_TV" else SOURCE_BY_LIB.get(lib, "movie")), False, tvdb_id
+        return ("pbs" if lib == "Kids_TV" else SOURCE_BY_LIB.get(lib, "movie")), False, tvdb_id
     return SOURCE_BY_LIB.get(lib, "tv"), False, tvdb_id
 
 
